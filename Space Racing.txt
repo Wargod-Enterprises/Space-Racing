@@ -1,0 +1,220 @@
+# Space Racing — Prototype Build Spec
+
+This document is a build brief for Claude Code. It describes the first playable prototype of a 3D racing game built in **Godot 4.7.2** using **GDScript**.
+
+## Read this first (notes for Claude Code)
+
+- **The person you're working with is not a programmer.** He's an experienced game designer who will test the game and judge how it feels. Explain things in plain language, tell him exactly what to click or press, and don't assume he can debug code himself.
+- **Engine:** Godot 4.7.2 (stable, Windows 64-bit). Use Godot 4 syntax and APIs only. Do not use Godot 3 patterns (`KinematicBody`, `export var`, `yield`, etc.). The project must not be opened in an older Godot version afterward.
+- **No third-party addons or assets.** Everything is built from Godot's built-in nodes, primitive meshes, and simple shaders.
+- **Build procedurally where possible.** Generate the track, ribbons, and hazards in code rather than in hand-written `.tscn` files with many nodes. Keep `.tscn` files minimal so they're less likely to break.
+- **All tuning numbers live in one place:** a `Tuning` autoload (`scripts/tuning.gd`) with clearly named, commented variables. The designer will want to tweak speeds, costs, and sizes without hunting through code.
+- **Use typed GDScript** and short comments that explain *what* a block does in game terms.
+- **Build in milestone order** (see the end of this document). After each milestone, make sure the project runs without errors, then tell the user in plain steps how to run it and what he should see and try. If Godot is available on the command line, use it headless to check for script errors before handing off.
+- **Don't overbuild.** Anything marked "stretch" or "out of scope" should not be built in this prototype.
+
+## The game in one paragraph
+
+It's 2060. Racers ride boards built from metamaterials that can lock onto Earth's magnetic field above the atmosphere. Each race is a loop around the planet along glowing field lines. Players ride a line to build speed, jump between neighboring lines to change altitude or position, and manage energy that recharges from the field itself. Lines bunch together near the poles, which makes the polar passes the fastest, tightest, most dangerous parts of every lap.
+
+## Goal of this prototype
+
+Prove that **riding and jumping between field lines feels fun.** That's it. No menus, career, upgrades, AI opponents, or story. One track, one rider, laps, a timer, and (last) a ghost of your best lap.
+
+## World and scale
+
+- **Earth:** a sphere at the world origin, radius `EARTH_RADIUS = 100` units. Simple blue/green material; a soft atmosphere rim glow is nice if cheap. Earth does not rotate.
+- **Space:** dark background with a simple starfield (shader or static particles).
+- **Light:** one `DirectionalLight3D` acting as the sun.
+- **Glow:** a `WorldEnvironment` with glow enabled so emissive ribbons bloom.
+
+## The track: field lines
+
+### Shape of one field line
+
+Earth's magnetic field is roughly a dipole. A dipole field line follows:
+
+```
+r(λ) = L · EARTH_RADIUS · cos²(λ)
+```
+
+where `r` is distance from Earth's center, `λ` is magnetic latitude (−90° to +90°), and `L` is the line's "shell" value (how far out it crosses the equator, in Earth radii).
+
+So a line with `L = 2` crosses the equator at 200 units and curves down toward the surface near the poles.
+
+### Making a closed racing loop
+
+A single field line goes from the southern hemisphere, out over the equator, and back down to the northern hemisphere. To make a loop:
+
+1. **Side A:** the field line in one meridian plane, from latitude −λc to +λc, where λc is the latitude at which the line drops to the lane's **hairpin altitude** (don't let it reach the surface).
+2. **North hairpin:** a smooth arc over the north pole at roughly constant radius, connecting the top of side A to the top of side B.
+3. **Side B:** the mirror-image field line on the opposite side of Earth (180° around), running back down from north to south.
+4. **South hairpin:** a matching arc under the south pole, closing the loop.
+
+The joins between the field-line sections and the hairpin arcs must be **smooth** (no visible kink). Blend them over a short section or fit tangents so the ribbon flows continuously.
+
+Represent each loop as a `Curve3D` (inside a `Path3D`) built from densely sampled points.
+
+### Lanes (a 3 × 3 grid)
+
+The track has **9 lanes**: 3 altitude levels × 3 side-by-side positions.
+
+- **Altitude levels (inner / middle / outer):** different `L` values. Start with `L = 1.4, 1.9, 2.6` (in `Tuning`).
+- **Side-by-side positions (left / center / right):** the same loop shape, shifted sideways perpendicular to the loop's plane by `LANE_SIDE_SPACING` (start with 8 units). Shifting sideways (rather than rotating to a new longitude) keeps lanes from all meeting at the pole.
+- **Hairpin altitude per level:** lanes should get close together near the poles (that's the point) but never overlap. Give each altitude level its own hairpin radius (for example `EARTH_RADIUS × (1.06, 1.12, 1.20)`) and keep at least a few units between neighboring lanes.
+
+### Shared progress along the track
+
+All lanes must share one **progress value** so jumping between lanes lands you at the "same place" on the track. Use the loop angle `θ` (0 to 2π, one full lap) as the shared parameter, and give every lane a function to get a position and orientation from `θ`. Arc length differs per lane (inner lanes are shorter), so convert speed to `θ` change per lane accordingly.
+
+### Field strength
+
+Field strength at a point (used for speed and energy):
+
+```
+B ∝ (EARTH_RADIUS / r)³ · sqrt(1 + 3·sin²(λ))
+```
+
+Normalize it so the strongest point on the inner lane is about 1.0. Strong field = higher top speed and faster energy recharge.
+
+### Visuals
+
+- Each lane is a **glowing ribbon** along its curve (for example `CSGPolygon3D` in path mode, or a generated `ArrayMesh` strip, whichever performs better). Width about 3 units.
+- Emissive color, brightness scaling with field strength so stronger sections glow brighter.
+- The lane the rider is on should be subtly highlighted.
+
+## Lane trade-offs (design intent)
+
+No lane should be strictly best. Starting intent, to be tuned:
+
+- **Inner lanes:** shortest loop and strongest field (fastest, best recharge), but the tightest hairpins with the lowest safe speed.
+- **Middle lanes:** balanced, but the equatorial section passes through the radiation belt.
+- **Outer lanes:** longest loop and weakest field, but gentle hairpins that can be taken at full speed.
+
+## The rider
+
+- A simple board and rider made from primitive meshes (a flat box board with a capsule rider is fine), with a subtle glow trail.
+- **Orientation:** forward = the lane's direction of travel; up = away from Earth's center. Smooth rotation so the rider doesn't snap through the hairpins.
+
+### Movement while riding
+
+- The rider is always locked to a lane except mid-jump.
+- **Accelerate** raises speed toward a top speed of `BASE_TOP_SPEED + FIELD_SPEED_BONUS × B`.
+- **Brake** slows down (needed for hairpins).
+- With no input, the rider slowly loses speed.
+
+### Jumping
+
+- Holding a direction shows a **landing marker** (a glowing ring) on the neighboring lane in that direction, placed slightly ahead to account for speed during the jump.
+  - Up = outward (higher altitude level). Down = inward. Left/right = side-by-side lanes. Directions are relative to the rider (up always means away from Earth).
+- If there is no lane in that direction, or not enough energy, the marker shows red and the jump doesn't happen.
+- Pressing **Jump** sends the rider on a short arc (about 0.45 seconds, with a slight bulge) to the marker, then relocks to the new lane at the matching progress. Speed is kept.
+- Each jump costs `JUMP_ENERGY_COST`.
+- No free-flight physics or missed landings in this prototype: if the jump is allowed, it lands.
+
+### Energy and boost
+
+- Energy bar, 0 to 100.
+- Recharges while riding at a rate proportional to field strength.
+- **Boost** (hold) drains energy and raises speed by about 40% above the current top speed.
+- At 0 energy: no boost, no jumping.
+
+### Polar hairpins
+
+- Each lane's hairpin has a **safe speed** (lower for inner lanes).
+- Entering the hairpin above the safe speed causes a **wobble**: speed is cut by about 40%, the camera shakes, and controls are unresponsive for about 0.5 seconds.
+- Show a warning on the HUD when approaching a hairpin too fast.
+
+## Hazard: the radiation belt
+
+- A region around the equator, roughly between `L = 1.7` and `L = 2.2`, within about 25° of the equator (values in `Tuning`), on both sides of Earth.
+- Shown as a semi-transparent colored haze (shader or particles), visible from a distance so players can plan around it.
+- While inside, **shields** (0 to 100) drain.
+- At 0 shields, top speed is capped at 50% until shields recover to 30. Shields recharge slowly outside the belt.
+- Detect the belt with a simple distance-and-latitude check in code (no physics bodies needed).
+
+## Atmosphere touches
+
+- **Auroras** at both poles: green and purple curtains using `GPUParticles3D` or a simple shader. Purely visual.
+
+## Camera
+
+- Third-person chase camera behind and slightly above the rider (`SpringArm3D` + `Camera3D`), smoothed so it doesn't jerk.
+- Pulls back slightly in hairpins so the player can see the bunched-up lanes; tightens on the straights for a stronger sense of speed.
+- Slight FOV increase while boosting.
+
+## Race structure
+
+- Start/finish gate at θ = 0 (side A, at the equator), shown as a ring or banner.
+- **3 laps** per race.
+- Rider starts on the center-middle lane.
+- After the race: show total time and best lap, and **R** to restart.
+
+## HUD
+
+Plain and readable:
+
+- Speed
+- Energy bar
+- Shield bar
+- Lap counter (e.g. 2 / 3)
+- Current lap time and best lap time
+- Small lane indicator (3 × 3 grid with the current lane lit)
+- Hairpin overspeed warning
+
+## Controls
+
+Set these up in the project's Input Map. Support both keyboard and gamepad.
+
+| Action | Keyboard | Gamepad |
+|---|---|---|
+| Accelerate | W | Right trigger |
+| Brake | S | Left trigger |
+| Jump direction | Arrow keys | Left stick |
+| Jump | Space | A / Cross |
+| Boost (hold) | Shift | B / Circle |
+| Restart race | R | Start |
+
+## Ghost of best lap (last milestone)
+
+- Record the rider's position and rotation each physics frame during a lap.
+- When a lap beats the best, save it as the ghost.
+- Replay the ghost as a translucent rider on following laps and races (in memory only; no saving to disk needed).
+
+## Out of scope for this prototype
+
+AI opponents, multiplayer, menus beyond the restart prompt, board upgrades and metamaterials, sponsors and career mode, solar storms, the South Atlantic Anomaly, space hotels and viewing platforms, sound and music (a simple whoosh is fine if trivial), saving data to disk.
+
+## Suggested project structure
+
+```
+res://
+  project.godot
+  scenes/
+    main.tscn          # root scene: loads everything else
+  scripts/
+    tuning.gd          # autoload: every tunable number
+    track.gd           # builds the 9 lanes, ribbons, gate
+    lane.gd            # one lane: position/orientation/field strength from θ
+    rider.gd           # riding, jumping, energy, shields, wobble
+    chase_camera.gd
+    hazards.gd         # radiation belt visuals + check
+    race_manager.gd    # laps, timing, restart
+    hud.gd
+    ghost.gd
+    environment.gd     # Earth, stars, sun, auroras, glow
+```
+
+Adjust if there's a cleaner layout, but keep it small and readable.
+
+## Milestones (build in this order)
+
+1. **World and track:** Earth, starfield, sun, glow, and all 9 lane ribbons visible. A free-look or orbit camera so the user can inspect the track shape.
+2. **Riding:** the rider rides the center-middle lane with accelerate/brake, correct orientation, chase camera.
+3. **Jumping:** landing marker, directional jumps between all 9 lanes, jump arc.
+4. **Energy and field strength:** speed tied to field strength, energy recharge, boost, jump cost.
+5. **Hairpins and radiation belt:** safe speeds and wobble, belt visuals, shield drain and speed cap, auroras.
+6. **Race and HUD:** start/finish gate, 3 laps, timers, HUD, restart.
+7. **Ghost:** record and replay best lap.
+
+After each milestone: confirm no errors, then give the user short, plain instructions to open the project in Godot 4.7.2, press **F5** (or the Play button), and what to look for and try. Ask him how it feels before moving on if anything about the feel is uncertain.
