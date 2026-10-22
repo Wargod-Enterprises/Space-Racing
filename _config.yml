@@ -1,0 +1,8 @@
+# Keep the design doc and game files in the repo but off the GitHub Pages site.
+exclude:
+  - README.md
+  - Space Racing.txt
+  - project.godot
+  - scenes
+  - scripts
+  - shaders
